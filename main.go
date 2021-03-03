@@ -33,7 +33,7 @@ func main() {
 		calmingRequestFile = buildDBFlagSet.String("calming-requests-file", "street-calming-ranked-2020-11.tsv", "calming requests TSV file")
 	)
 
-	withStore := func(inner func(context.Context, *store, []string) error) func(context.Context, []string) error {
+	withSqliteStore := func(inner func(context.Context, *sqliteStore, []string) error) func(context.Context, []string) error {
 		return (func(ctx context.Context, args []string) error {
 			db, err := sql.Open("sqlite", *databaseFile)
 			if err != nil {
@@ -41,7 +41,13 @@ func main() {
 			}
 			defer db.Close()
 
-			st := &store{db: db}
+			st := &sqliteStore{db: db}
+			return inner(ctx, st, args)
+		})
+	}
+
+	withStore := func(inner func(context.Context, store, []string) error) func(context.Context, []string) error {
+		return withSqliteStore(func(ctx context.Context, st *sqliteStore, args []string) error {
 			return inner(ctx, st, args)
 		})
 	}
@@ -49,7 +55,7 @@ func main() {
 	cmdBuildDB := &ffcli.Command{
 		Name:      "builddb",
 		ShortHelp: "build database from centreline and request data",
-		Exec: withStore(func(_ context.Context, st *store, _ []string) error {
+		Exec: withSqliteStore(func(_ context.Context, st *sqliteStore, _ []string) error {
 			if err := st.init(); err != nil {
 				return err
 			}
@@ -107,7 +113,14 @@ func main() {
 	}
 }
 
-func routeViz(_ context.Context, st *store, args []string) error {
+type store interface {
+	requests() ([]request, error)
+	filterSegments(segmentFilter) ([]segment, error)
+	routeLinks(routeID int) (map[int][]int, error)
+	route([]segment, []segment) ([]segment, error)
+}
+
+func routeViz(_ context.Context, st store, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("need route id")
 	}
@@ -117,7 +130,7 @@ func routeViz(_ context.Context, st *store, args []string) error {
 		return err
 	}
 
-	segs, err := st.querySegments(segmentQuery+"where route_id=?", routeID)
+	segs, err := st.filterSegments(segmentFilter{routeIDs: []int{routeID}})
 	if err != nil {
 		return err
 	}
@@ -146,7 +159,7 @@ func routeViz(_ context.Context, st *store, args []string) error {
 	return nil
 }
 
-func export(_ context.Context, st *store, args []string) error {
+func export(_ context.Context, st store, args []string) error {
 	reqs, err := st.requests()
 	if err != nil {
 		return err
@@ -217,7 +230,7 @@ type requestHandler struct {
 	routeHandler func(processingRequest) ([]segment, error)
 }
 
-func newDefaultRequestHandler(st *store, req request) requestHandler {
+func newDefaultRequestHandler(st store, req request) requestHandler {
 	return requestHandler{
 		req:          req,
 		startHandler: overrideDiscovery("start", st, startDiscovery(st)),
@@ -287,7 +300,7 @@ func (s requestHandler) handle() (requestResult, error) {
 	}, nil
 }
 
-func overrideDiscovery(when string, st *store, next func(preq processingRequest) ([]segment, error)) func(preq processingRequest) ([]segment, error) {
+func overrideDiscovery(when string, st store, next func(preq processingRequest) ([]segment, error)) func(preq processingRequest) ([]segment, error) {
 	return func(preq processingRequest) ([]segment, error) {
 		f, err := os.Open(fmt.Sprintf("overrides/%d.%s", preq.req.rank, when))
 		if os.IsNotExist(err) {
@@ -310,20 +323,19 @@ func overrideDiscovery(when string, st *store, next func(preq processingRequest)
 		if sc.Err() != nil {
 			return nil, sc.Err()
 		}
-		return st.segmentsByIDs(ids)
+		return st.filterSegments(segmentFilter{ids: ids})
 	}
 }
 
-func startDiscovery(st *store) func(preq processingRequest) ([]segment, error) {
+func startDiscovery(st store) func(preq processingRequest) ([]segment, error) {
 	return func(preq processingRequest) ([]segment, error) {
-		q := segmentQuery + "where full_name=upper(?)"
-		args := []interface{}{strings.ReplaceAll(preq.req.streetName, "'", "")}
+		filter := segmentFilter{fullNames: []string{strings.ReplaceAll(preq.req.streetName, "'", "")}}
 		if preq.req.from != "" {
-			q += " and upper(?) in (from_str, to_str)"
-			args = append(args, strings.ReplaceAll(preq.req.from, "'", ""))
+			dqf := strings.ReplaceAll(preq.req.from, "'", "")
+			filter.endStreets = []string{dqf}
 		}
 
-		segs, err := st.querySegments(q, args...)
+		segs, err := st.filterSegments(filter)
 		if err != nil {
 			return nil, err
 		}
@@ -340,16 +352,15 @@ func startDiscovery(st *store) func(preq processingRequest) ([]segment, error) {
 	}
 }
 
-func endDiscovery(st *store) func(preq processingRequest) ([]segment, error) {
+func endDiscovery(st store) func(preq processingRequest) ([]segment, error) {
 	return func(preq processingRequest) ([]segment, error) {
-		q := segmentQuery + "where route_id=?"
-		args := []interface{}{preq.startSegments[0].routeID}
+		filter := segmentFilter{routeIDs: []int{preq.startSegments[0].routeID}}
 		if preq.req.to != "" {
-			q += " and upper(?) in (from_str, to_str)"
-			args = append(args, strings.ReplaceAll(preq.req.to, "'", ""))
+			dqt := strings.ReplaceAll(preq.req.to, "'", "")
+			filter.endStreets = []string{dqt}
 		}
 
-		segs, err := st.querySegments(q, args...)
+		segs, err := st.filterSegments(filter)
 		if err != nil {
 			return nil, err
 		}
@@ -358,11 +369,11 @@ func endDiscovery(st *store) func(preq processingRequest) ([]segment, error) {
 	}
 }
 
-func routeDiscovery(st *store) func(preq processingRequest) ([]segment, error) {
+func routeDiscovery(st store) func(preq processingRequest) ([]segment, error) {
 	return func(preq processingRequest) ([]segment, error) {
 		// For entire streets, return all segments on the route.
 		if preq.req.from == "" && preq.req.to == "" {
-			return st.querySegments(segmentQuery+"where route_id=?", preq.startSegments[0].routeID)
+			return st.filterSegments(segmentFilter{routeIDs: []int{preq.startSegments[0].routeID}})
 		}
 
 		route, err := st.route(preq.startSegments, preq.endSegments)
@@ -423,7 +434,7 @@ func (r request) String() string {
 	return out
 }
 
-func (s store) requests() ([]request, error) {
+func (s sqliteStore) requests() ([]request, error) {
 	rows, err := s.db.Query("select street_name, start, end, district, rank from requests order by rank")
 	if err != nil {
 		return nil, err
@@ -465,12 +476,12 @@ func (s segment) String() string {
 	return fmt.Sprintf("%d %s from %s to %s", s.id, s.name, s.from, s.to)
 }
 
-type store struct {
+type sqliteStore struct {
 	db *sql.DB
 }
 
 // route finds a route between any of the fromSegments to any of the toSegments.
-func (s store) route(fromSegments []segment, toSegments []segment) ([]segment, error) {
+func (s sqliteStore) route(fromSegments []segment, toSegments []segment) ([]segment, error) {
 	if len(fromSegments) == 0 || len(toSegments) == 0 {
 		return nil, fmt.Errorf("empty fromSegments or empty toSegments")
 	}
@@ -538,7 +549,7 @@ func (s store) route(fromSegments []segment, toSegments []segment) ([]segment, e
 		return nil, fmt.Errorf("could not find path")
 	}
 
-	segs, err := s.segmentsByIDs(path)
+	segs, err := s.filterSegments(segmentFilter{ids: path})
 	if err != nil {
 		return nil, err
 	}
@@ -552,7 +563,7 @@ func (s store) route(fromSegments []segment, toSegments []segment) ([]segment, e
 	return segs, nil
 }
 
-func (s store) routeLinks(routeID int) (map[int][]int, error) {
+func (s sqliteStore) routeLinks(routeID int) (map[int][]int, error) {
 	links := make(map[int][]int)
 
 	rows, err := s.db.Query("select id, next_id from segment_links where route_id=?", routeID)
@@ -572,22 +583,57 @@ func (s store) routeLinks(routeID int) (map[int][]int, error) {
 	return links, rows.Err()
 }
 
-func (s store) segmentsByIDs(ids []int) ([]segment, error) {
-	var list string
-	for i, id := range ids {
-		if i > 0 {
-			list += ","
-		}
-		list += strconv.Itoa(id)
-	}
-	return s.querySegments(segmentQuery + "where id in (" + list + ")")
+// Uses approach described in https://www.gobeyond.dev/real-world-sql-part-one/ but with
+// slices instead of pointers to ints/etc.
+type segmentFilter struct {
+	ids        []int
+	fullNames  []string
+	routeIDs   []int
+	endStreets []string
 }
 
-const (
-	segmentQuery = "select id, full_name, from_str, to_str, route_id, direction, line_string, first_point, last_point, str_name, str_type, st_class from segments "
-)
+func (s sqliteStore) filterSegments(filter segmentFilter) ([]segment, error) {
+	where, args := []string{"1 = 1"}, []interface{}{}
 
-func (s store) querySegments(q string, args ...interface{}) ([]segment, error) {
+	if len(filter.ids) > 0 {
+		var idw []string
+		for _, id := range filter.ids {
+			idw = append(idw, "id = ?")
+			args = append(args, id)
+		}
+		where = append(where, "("+strings.Join(idw, " or ")+")")
+	}
+
+	if len(filter.fullNames) > 0 {
+		var fnw []string
+		for _, fn := range filter.fullNames {
+			fnw = append(fnw, "full_name = upper(?)")
+			args = append(args, fn)
+		}
+		where = append(where, "("+strings.Join(fnw, " or ")+")")
+	}
+
+	if len(filter.routeIDs) > 0 {
+		var idw []string
+		for _, id := range filter.routeIDs {
+			idw = append(idw, "route_id = ?")
+			args = append(args, id)
+		}
+		where = append(where, "("+strings.Join(idw, " or ")+")")
+	}
+
+	if len(filter.endStreets) > 0 {
+		var esw []string
+		for _, es := range filter.endStreets {
+			esw = append(esw, "upper(?) in (from_str, to_str)")
+			args = append(args, es)
+		}
+		where = append(where, "("+strings.Join(esw, " or ")+")")
+	}
+
+	q := "select id, full_name, from_str, to_str, route_id, direction, line_string, first_point, last_point, str_name, str_type, st_class from segments where "
+	q += strings.Join(where, " and ")
+
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
@@ -630,7 +676,7 @@ func (s store) querySegments(q string, args ...interface{}) ([]segment, error) {
 	return segs, rows.Err()
 }
 
-func (s store) init() error {
+func (s sqliteStore) init() error {
 	for _, q := range []string{
 		"create table segments (id integer primary key, str_name text, str_type text, st_class, full_name text, from_str text, to_str text, route_id integer, direction text, line_string json, first_point json, last_point json)",
 		"create table segment_links (id integer, route_id integer, next_id integer)",
@@ -644,7 +690,7 @@ func (s store) init() error {
 	return nil
 }
 
-func (s store) loadSegments(segments []segment) error {
+func (s sqliteStore) loadSegments(segments []segment) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -767,7 +813,7 @@ func (s store) loadSegments(segments []segment) error {
 	return nil
 }
 
-func (s store) loadRequests(reqs []request) error {
+func (s sqliteStore) loadRequests(reqs []request) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -795,7 +841,7 @@ func (s store) loadRequests(reqs []request) error {
 	return tx.Commit()
 }
 
-func loadKMLSegments(st *store, kmlReader io.Reader) error {
+func loadKMLSegments(st *sqliteStore, kmlReader io.Reader) error {
 	var d document
 	if err := xml.NewDecoder(kmlReader).Decode(&d); err != nil {
 		return err
@@ -843,7 +889,7 @@ func loadKMLSegments(st *store, kmlReader io.Reader) error {
 	return st.loadSegments(segments)
 }
 
-func loadTSVRequests(st *store, requestReader io.Reader) error {
+func loadTSVRequests(st *sqliteStore, requestReader io.Reader) error {
 	var reqs []request
 
 	sc := bufio.NewScanner(requestReader)

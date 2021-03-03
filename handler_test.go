@@ -61,7 +61,7 @@ func TestStartDiscovery(t *testing.T) {
 			}
 			defer db.Close()
 
-			st := &store{db: db}
+			st := &sqliteStore{db: db}
 			if err := st.init(); err != nil {
 				t.Fatal(err)
 			}
@@ -114,7 +114,7 @@ func TestStartDiscoveryError(t *testing.T) {
 			}
 			defer db.Close()
 
-			st := &store{db: db}
+			st := &sqliteStore{db: db}
 			if err := st.init(); err != nil {
 				t.Fatal(err)
 			}
@@ -197,7 +197,7 @@ func TestEndDiscovery(t *testing.T) {
 			}
 			defer db.Close()
 
-			st := &store{db: db}
+			st := &sqliteStore{db: db}
 			if err := st.init(); err != nil {
 				t.Fatal(err)
 			}
@@ -301,7 +301,7 @@ func TestRouteDiscovery(t *testing.T) {
 			}
 			defer db.Close()
 
-			st := &store{db: db}
+			st := &sqliteStore{db: db}
 			if err := st.init(); err != nil {
 				t.Fatal(err)
 			}

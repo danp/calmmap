@@ -7,7 +7,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-func fixup(_ context.Context, st *store, _ []string) error {
+func fixup(_ context.Context, st store, _ []string) error {
 	reqs, err := st.requests()
 	if err != nil {
 		return err
