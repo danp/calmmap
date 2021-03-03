@@ -1,0 +1,5 @@
+calmmap
+*.db
+*.kml
+*.pdf
+*.tsv
